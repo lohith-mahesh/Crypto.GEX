@@ -1,6 +1,6 @@
 # Crypto.GEX
 
-**Real-Time Institutional Options Analytics Terminal.**
+**Real-Time Options Analytics Terminal.**
 
 A high-performance, localized financial telemetry engine for analyzing Deribit option chains. Designed with a **"Split-Brain" architecture**, it combines a robust Python backend for high-throughput data ingestion with a client-side JavaScript math engine for zero-latency Black-Scholes calculations.
 
