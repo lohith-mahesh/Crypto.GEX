@@ -3,19 +3,15 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 import aiohttp
 import asyncio
-import numpy as np
-from datetime import datetime
-import webbrowser
+from datetime import datetime, timezone
 import logging
 import json
 import contextlib
-import os  # <--- Required for path fixing
+import os
 
-# Logging Configuration
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("CRYPTO-GEX")
 
-# Constants
 BASE_URL = "https://www.deribit.com/api/v2/public/"
 MONTH_MAP = {
     "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
@@ -62,10 +58,13 @@ class Analytics:
 class MarketData:
     def __init__(self):
         self.session = None
+        self.cache = {}
+        self.active_tickers = set()
 
     async def start(self):
         if not self.session:
             self.session = aiohttp.ClientSession(headers={"User-Agent": "CryptoGEX/1.0"})
+        asyncio.create_task(self.polling_loop())
 
     async def stop(self):
         if self.session: await self.session.close()
@@ -83,7 +82,7 @@ class MarketData:
             day = int(date_str[:2])
             mon = date_str[2:5].upper()
             year = int(date_str[5:]) + 2000
-            if mon in MONTH_MAP: return datetime(year, MONTH_MAP[mon], day)
+            if mon in MONTH_MAP: return datetime(year, MONTH_MAP[mon], day, 8, 0, 0, tzinfo=timezone.utc)
         except: return None
         return None
 
@@ -109,7 +108,7 @@ class MarketData:
 
         chain = []
         seen = set()
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         prefix = ticker.upper()
 
         for d in raw:
@@ -149,15 +148,24 @@ class MarketData:
             "pcr": Analytics.pcr(chain),
             "avg_iv": Analytics.weighted_iv(chain),
             "chain": chain,
-            "ts": datetime.now().strftime("%H:%M:%S")
+            "ts": now.strftime("%H:%M:%S")
         }
+
+    async def polling_loop(self):
+        while True:
+            for ticker in list(self.active_tickers):
+                try:
+                    data = await self.snapshot(ticker)
+                    self.cache[ticker] = data
+                except Exception as e:
+                    logger.error(f"Polling error for {ticker}: {e}")
+            await asyncio.sleep(4)
 
 engine = MarketData()
 
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
     await engine.start()
-    webbrowser.open("http://127.0.0.1:8000")
     yield
     await engine.stop()
 
@@ -167,23 +175,35 @@ app = FastAPI(title="Crypto.GEX", lifespan=lifespan)
 async def ws_handler(websocket: WebSocket):
     await websocket.accept()
     logger.info("Client connected")
+    current_ticker = None
     try:
         while True:
             try:
-                msg = await asyncio.wait_for(websocket.receive_text(), timeout=0.1)
+                msg = await asyncio.wait_for(websocket.receive_text(), timeout=1.0)
                 data = json.loads(msg)
                 
                 if data.get('action') == 'sub':
-                    logger.info(f"Subscribing to {data['ticker']}")
-                    res = await engine.snapshot(data['ticker'].upper())
+                    ticker = data['ticker'].upper()
+                    current_ticker = ticker
+                    logger.info(f"Subscribing to {ticker}")
+                    engine.active_tickers.add(ticker)
                     
+                    if ticker in engine.cache:
+                        res = engine.cache[ticker]
+                    else:
+                        res = await engine.snapshot(ticker)
+                        engine.cache[ticker] = res
+
                     if "error" in res:
                         await websocket.send_json({"type": "error", "msg": res['error']})
                     else:
                         await websocket.send_json({"type": "data", "payload": res})
                         
             except asyncio.TimeoutError:
-                pass
+                if current_ticker and current_ticker in engine.cache:
+                    res = engine.cache[current_ticker]
+                    if "error" not in res:
+                        await websocket.send_json({"type": "data", "payload": res})
                 
     except WebSocketDisconnect:
         logger.info("Client disconnected")
@@ -195,7 +215,6 @@ async def ws_handler(websocket: WebSocket):
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
-    # PATH FIX: Gets the absolute path of the directory where app.py is located
     current_dir = os.path.dirname(os.path.abspath(__file__))
     file_path = os.path.join(current_dir, "index.html")
     
@@ -203,7 +222,7 @@ async def home():
         with open(file_path, "r", encoding='utf-8') as f:
             return f.read()
     except FileNotFoundError:
-        return f"Error: index.html not found at {file_path}. Please ensure it is in the same directory."
+        return "Error: index.html not found."
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8000)
