@@ -73,7 +73,7 @@
             <div id="val-spot" class="val-large text-blue-400">---</div>
         </div>
         <div class="card bg-gray-900 border-gray-800">
-            <span class="card-label text-purple-400" data-tooltip="Volume Weighted Average Price (Strike). The 'Center of Gravity' for today's volume.">VOLUME STRUCTURE</span>
+            <span class="card-label text-purple-400" data-tooltip="Volume Weighted Average Price (Strike).">VOLUME STRUCTURE</span>
             <div class="flex justify-between text-xs mt-2 border-b border-gray-800 pb-1">
                 <span class="text-gray-500" data-tooltip="Chain VWAP">VWAP</span>
                 <span id="val-vwap" class="text-white font-bold">---</span>
@@ -147,7 +147,9 @@
     let ws = null, masterData = null;
 
     function init() {
-        ws = new WebSocket(`ws://${window.location.host}/ws`);
+        const protocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+        ws = new WebSocket(`${protocol}${window.location.host}/ws`);
+        
         ws.onopen = () => {
             document.getElementById('status').innerText = "ONLINE";
             document.getElementById('status').className = "text-[10px] font-bold text-green-500";
@@ -177,7 +179,7 @@
         if(e.key === 'Enter') {
             const val = e.target.value.toUpperCase().trim();
             if(val) {
-                if (ws.readyState === WebSocket.OPEN) {
+                if (ws && ws.readyState === WebSocket.OPEN) {
                     ws.send(JSON.stringify({action: "sub", ticker: val}));
                     document.getElementById('msg-box').innerText = "CALCULATING...";
                     document.getElementById('expiry-dd').innerHTML = '<option value="ALL">ALL EXPIRIES</option>';
@@ -288,7 +290,3 @@
 </script>
 </body>
 </html>
-"""
-
-if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8000)
