@@ -1,12 +1,3 @@
----
-title: Crypto GEX Terminal
-sdk: docker
-emoji: 
-colorFrom: blue
-colorTo: gray
-app_port: 7860
----
-
 # Crypto.GEX | Options Liquidity & Volatility Terminal
 
 A high-performance analytics environment designed for real-time monitoring of Deribit options market structure. This project utilizes server-side Black-Scholes modeling and liquidity integration to identify dealer positioning and volatility-driven price magnets across BTC, ETH, and SOL.
