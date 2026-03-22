@@ -4,38 +4,88 @@ from fastapi.responses import HTMLResponse
 import aiohttp
 import asyncio
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 import webbrowser
 import logging
 import json
 import contextlib
-import os  # <--- Required for path fixing
+import os
+import math
 
-# Logging Configuration
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("CRYPTO-GEX")
 
-# Constants
 BASE_URL = "https://www.deribit.com/api/v2/public/"
 MONTH_MAP = {
     "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
     "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12
 }
 
+class Greeks:
+    @staticmethod
+    def nd1(d):
+        return 0.5 * (1.0 + math.erf(d / math.sqrt(2.0)))
+
+    @staticmethod
+    def npd1(d):
+        return math.exp(-0.5 * d**2) / math.sqrt(2 * math.pi)
+
+    @classmethod
+    def calculate(cls, S, K, T, sigma, r, type):
+        if T <= 0 or sigma <= 0:
+            return 0.0, 0.0, 0.0, 0.0
+        
+        try:
+            d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
+            d2 = d1 - sigma * math.sqrt(T)
+            
+            if type == 'C':
+                delta = cls.nd1(d1)
+                gamma = cls.npd1(d1) / (S * sigma * math.sqrt(T))
+                theta = -(S * cls.npd1(d1) * sigma) / (2 * math.sqrt(T)) - r * K * math.exp(-r * T) * cls.nd1(d2)
+                vega = S * cls.npd1(d1) * math.sqrt(T)
+            else:
+                delta = cls.nd1(d1) - 1
+                gamma = cls.npd1(d1) / (S * sigma * math.sqrt(T))
+                theta = -(S * cls.npd1(d1) * sigma) / (2 * math.sqrt(T)) + r * K * math.exp(-r * T) * cls.nd1(-d2)
+                vega = S * cls.npd1(d1) * math.sqrt(T)
+            
+            return delta, gamma, theta, vega
+        except:
+            return 0.0, 0.0, 0.0, 0.0
+
+class Cache:
+    def __init__(self):
+        self.store = {}
+
+    def get(self, key):
+        entry = self.store.get(key)
+        if entry and datetime.now() < entry['expiry']:
+            return entry['data']
+        return None
+
+    def set(self, key, data, ttl=5):
+        self.store[key] = {
+            'data': data,
+            'expiry': datetime.now() + timedelta(seconds=ttl)
+        }
+
 class Analytics:
     @staticmethod
     def max_pain(chain):
         if not chain: return 0
         strikes = sorted({o['k'] for o in chain})
-        step = max(1, len(strikes)//100)
         min_pain = float('inf')
         pain_price = 0
         
-        for price in strikes[::step]:
+        for price in strikes:
             loss = 0
             for o in chain:
-                if o['ty'] == 'C' and price > o['k']: loss += (price - o['k']) * o['oi']
-                elif o['ty'] == 'P' and price < o['k']: loss += (o['k'] - price) * o['oi']
+                if o['ty'] == 'C' and price > o['k']: 
+                    loss += (price - o['k']) * o['oi']
+                elif o['ty'] == 'P' and price < o['k']: 
+                    loss += (o['k'] - price) * o['oi']
+            
             if loss < min_pain:
                 min_pain = loss
                 pain_price = price
@@ -59,23 +109,49 @@ class Analytics:
         if not total_vol: return 0
         return sum(o['k'] * o['vol'] for o in chain) / total_vol
 
+    @staticmethod
+    def skew_25d(chain, spot):
+        calls = [o for o in chain if o['ty'] == 'C' and abs(o['k'] - spot*1.1) < spot*0.05]
+        puts = [o for o in chain if o['ty'] == 'P' and abs(o['k'] - spot*0.9) < spot*0.05]
+        if not calls or not puts: return 0
+        c_iv = sum(o['iv'] for o in calls) / len(calls)
+        p_iv = sum(o['iv'] for o in puts) / len(puts)
+        return round(p_iv - c_iv, 4)
+
+    @staticmethod
+    def term_structure(chain):
+        expiries = sorted({o['exp'] for o in chain})
+        structure = []
+        for e in expiries:
+            subset = [o for o in chain if o['exp'] == e]
+            structure.append({"exp": e, "iv": Analytics.weighted_iv(subset)})
+        return structure
+
 class MarketData:
     def __init__(self):
         self.session = None
+        self.cache = Cache()
 
     async def start(self):
         if not self.session:
-            self.session = aiohttp.ClientSession(headers={"User-Agent": "CryptoGEX/1.0"})
+            self.session = aiohttp.ClientSession(headers={"User-Agent": "CryptoGEX/2.0"})
 
     async def stop(self):
-        if self.session: await self.session.close()
+        if self.session: 
+            await self.session.close()
 
     async def fetch(self, url):
+        cached = self.cache.get(url)
+        if cached: return cached
         try:
             async with self.session.get(url, timeout=5) as resp:
-                return await resp.json() if resp.status == 200 else None
+                if resp.status == 200:
+                    data = await resp.json()
+                    self.cache.set(url, data)
+                    return data
+                return None
         except Exception as e:
-            logger.error(f"Fetch Error {url}: {e}")
+            logger.error(f"Network error: {e}")
             return None
 
     def _parse_expiry(self, date_str):
@@ -125,21 +201,23 @@ class MarketData:
                 if not exp or exp <= now: continue
                 k = float(parts[2])
                 
-                if not (spot * 0.1 < k < spot * 3.0): continue
+                if not (spot * 0.2 < k < spot * 2.5): continue
+
+                iv = d.get('mark_iv', 0) / 100
+                t = (exp - now).total_seconds() / 31536000
+                oi = d.get('open_interest', 0)
+                ty = parts[3]
+
+                delta, gamma, theta, vega = Greeks.calculate(spot, k, t, iv, 0.05, ty)
 
                 chain.append({
-                    "k": k,
-                    "t": (exp - now).total_seconds() / 31536000,
-                    "iv": d.get('mark_iv', 0) / 100,
-                    "oi": d.get('open_interest', 0),
-                    "vol": d.get('volume', 0),
-                    "ty": parts[3],
-                    "exp": parts[1]
+                    "k": k, "t": t, "iv": iv, "oi": oi,
+                    "vol": d.get('volume', 0), "ty": ty, "exp": parts[1],
+                    "delta": delta, "gamma": gamma, "theta": theta, "vega": vega
                 })
             except: continue
 
         if not chain: return {"error": "No options found"}
-
         chain.sort(key=lambda x: x['k'])
 
         return {
@@ -148,6 +226,8 @@ class MarketData:
             "max_pain": Analytics.max_pain(chain),
             "pcr": Analytics.pcr(chain),
             "avg_iv": Analytics.weighted_iv(chain),
+            "skew": Analytics.skew_25d(chain, spot),
+            "structure": Analytics.term_structure(chain),
             "chain": chain,
             "ts": datetime.now().strftime("%H:%M:%S")
         }
@@ -161,49 +241,49 @@ async def lifespan(app: FastAPI):
     yield
     await engine.stop()
 
-app = FastAPI(title="Crypto.GEX", lifespan=lifespan)
+app = FastAPI(title="Crypto.GEX Terminal", lifespan=lifespan)
 
 @app.websocket("/ws")
 async def ws_handler(websocket: WebSocket):
     await websocket.accept()
-    logger.info("Client connected")
     try:
         while True:
-            try:
-                msg = await asyncio.wait_for(websocket.receive_text(), timeout=0.1)
-                data = json.loads(msg)
-                
-                if data.get('action') == 'sub':
-                    logger.info(f"Subscribing to {data['ticker']}")
-                    res = await engine.snapshot(data['ticker'].upper())
-                    
-                    if "error" in res:
-                        await websocket.send_json({"type": "error", "msg": res['error']})
-                    else:
-                        await websocket.send_json({"type": "data", "payload": res})
-                        
-            except asyncio.TimeoutError:
-                pass
-                
+            msg = await websocket.receive_json()
+            if msg.get('action') == 'sub':
+                ticker = msg.get('ticker', '').upper()
+                res = await engine.snapshot(ticker)
+                if "error" in res:
+                    await websocket.send_json({"type": "error", "msg": res['error']})
+                else:
+                    await websocket.send_json({"type": "data", "payload": res})
     except WebSocketDisconnect:
-        logger.info("Client disconnected")
+        pass
     except Exception as e:
-        logger.error(f"WebSocket Error: {e}")
+        logger.error(f"WS Error: {e}")
     finally:
-        try: await websocket.close()
-        except: pass
+        try: 
+            await websocket.close()
+        except: 
+            pass
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
-    # PATH FIX: Gets the absolute path of the directory where app.py is located
     current_dir = os.path.dirname(os.path.abspath(__file__))
     file_path = os.path.join(current_dir, "index.html")
-    
     try:
         with open(file_path, "r", encoding='utf-8') as f:
             return f.read()
     except FileNotFoundError:
-        return f"Error: index.html not found at {file_path}. Please ensure it is in the same directory."
+        return f"Error: index.html not found."
+
+@app.get("/api/v1/health")
+async def health():
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+
+@app.get("/api/v1/snapshot/{ticker}")
+async def get_ticker_snapshot(ticker: str):
+    data = await engine.snapshot(ticker.upper())
+    return data
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8000)
