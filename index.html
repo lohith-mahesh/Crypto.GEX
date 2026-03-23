@@ -224,7 +224,6 @@
 
         const pcrVal = document.getElementById('val-pcr');
         pcrVal.innerText = masterData.pcr;
-        // Forced to white as per request
         pcrVal.className = "val-large text-white";
 
         const avgT = (selExp === 'ALL') ? 7/365 : chain[0].t;
