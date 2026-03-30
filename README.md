@@ -1,73 +1,68 @@
-# Crypto.Gex | Options Liquidity & Volatility Terminal
+# CRYPTO.GEX | Options Market Structure Terminal
 
-A high-performance analytics environment designed for real-time monitoring of Deribit options market structure. This project utilizes server-side Black-Scholes modeling and liquidity integration to identify dealer positioning and volatility-driven price magnets across BTC, ETH, and SOL.
+This terminal provides real-time monitoring of Deribit options liquidity and volatility dynamics. It utilizes a hybrid-compute architecture to identify dealer positioning and price magnets across BTC, ETH, and SOL.
 
 ![Terminal Dashboard](Demo.png)
 
-## Core Technical Architecture
+---
 
-### 1. Net Gamma Exposure (GEX) Modeling
+## Technical Architecture
 
-The engine calculates the dollar value of the underlying asset that option dealers must hedge per 1% move in the spot price. This identifies "Gamma Walls" where dealer hedging activity either dampens or accelerates price volatility.
+The system operates on a split-execution model to balance precision with low-latency updates:
 
-**Standard GEX Equation:**
-`GEX = Γ × Open Interest × Spot² × 0.01`
+* **Backend (Python/FastAPI):** Executes a closed-form Black-Scholes-Merton (BSM) model to calculate Greeks for every instrument in the Deribit universe. It handles data ingestion, index price tracking, and multi-currency book consolidation.
+* **Frontend (Vanilla JS/Plotly):** Performs real-time aggregation of Net Gamma Exposure (GEX) and geometric rendering. This offloads the high-frequency summation of the option chain to the client hardware.
 
-The terminal aggregates Net GEX across all active strikes, providing a visual heatmap of support (Positive GEX) and resistance (Negative GEX) zones.
+---
 
-### 2. Server-Side Greeks Engine (Black-Scholes)
+## Core Analytics
 
-Unlike standard front-end implementations, this terminal executes a closed-form Black-Scholes-Merton model on the backend to ensure precision and low-latency updates. 
+### 1. Net Gamma Exposure (GEX)
+The terminal calculates the dollar value that dealers must hedge per 1% move in the spot price. This identifies "Gamma Walls" where hedging activity either dampens or accelerates price volatility.
 
-* **State Estimation:** The model calculates d1 and d2 to derive Delta (Δ), Gamma (Γ), Theta (Θ), and Vega (ν) for every instrument in the Deribit universe.
-* **Risk-Free Dynamics:** Incorporates a dynamic risk-free rate (r), default 5%, to account for the cost of carry in crypto-native margin environments.
+$$GEX = \Gamma \times \text{Open Interest} \times \text{Spot}^{2} \times 0.01$$
 
-### 3. Oracle 1-Sigma Range Projection
+### 2. Oracle 1-Sigma Range
+The system projects the expected move for the current session or specific expiry using a weighted Implied Volatility ($\sigma$) metric.
 
-The system utilizes a weighted Implied Volatility (σ) metric to project the expected move for the current session based on time to expiry (T).
+$$\text{Expected Move} = \text{Spot} \times \sigma \times \sqrt{T}$$
 
-**Expected Move Formula:**
-`1σ Move = Spot × Average σ × √(T)`
+### 3. Max Pain and Pinning
+The engine identifies the "Max Pain" strike by iterating through the strike ladder to find the local minimum of the total loss function for option buyers. This serves as a center of gravity for price action as expiration approaches.
 
-This provides a "Volatility Cone" on the chart, identifying where the market is pricing a 68% probability of price containment.
+---
 
-### 4. Max Pain & Pinning Analysis
-
-The terminal identifies the "Max Pain" strike—the price level where the aggregate value of outstanding options is minimized at expiry.
-
-* **Mechanism:** The engine iterates through the entire strike ladder to find the local minimum of the total loss function for option buyers.
-
-This metric serves as a secondary "Center of Gravity" for price action as expiration approaches, highlighting potential pinning behavior.
-
-### 5. Volume Structure (VWAP)
-
-The system calculates the Volume-Weighted Average Price (Strike) to identify the center of gravity for today’s trading activity.
-
-**Strike VWAP Calculation:**
-`Strike VWAP = Σ(Strike × Volume) / Σ(Volume)`
-
-This identifies whether the current day's volume is concentrating at OTM (Out-of-the-Money) strikes (K) or ITM (In-the-Money) directional hedging.
-
-## Data Pipeline & Rigor
+## Data Pipeline Logic
 
 ### Real-Time Ingestion
+* **Concurrency:** Utilizes `asyncio.gather` and `aiohttp` to fetch index prices and book summaries for Coin-margined and USDC-margined instruments simultaneously.
+* **Caching:** Implements a 5-second TTL (Time-To-Live) cache to stay within Deribit public rate limits of 20 requests per second.
 
-The scanner utilizes an asynchronous WebSocket loop to fetch market data from Deribit. To manage API rate limits and memory overhead, the backend implements a secondary caching layer with a 5-second TTL (Time-To-Live).
+### Filtering and Assumptions
+* **Moneyness:** Only strikes within a 20% to 250% range of the spot price are processed to eliminate illiquid data.
+* **Temporal:** Expired or near-instantaneous contracts are discarded to prevent mathematical artifacts in GEX spikes.
+* **Risk-Free Rate:** Hardcoded at 5% (0.05) to approximate the cost of carry in crypto-native margin environments.
+* **Skew:** The 25-delta skew is calculated as a ±10% spot price approximation for computational efficiency.
 
-### Data Filtering
+---
 
-To maintain signal integrity, the engine applies strict filtering protocols:
-* **Moneyness Filter:** Only strikes within a 20% to 250% range of the spot price are processed to remove illiquid "dust" strikes.
-* **Temporal Filter:** Expired or near-instantaneous expiries (T ≈ 0) are discarded to prevent Gamma spikes from distorting the aggregate GEX profile.
-
-## Logic Stack
+## Implementation Stack
 
 * **Language:** Python 3.10+
-* **Backend:** FastAPI (Asynchronous WebSocket handling and REST API)
-* **Frontend:** Vanilla JS, Tailwind CSS, Plotly.js (Real-time bar and line geometry)
-* **Statistics:** NumPy (Vectorized math for Greeks and GEX)
-* **Network:** Aiohttp (Concurrent API fetching)
+* **Web Framework:** FastAPI with Asynchronous WebSockets
+* **Math:** NumPy for vectorized operations and `math.erf` for BSM CDF calculations
+* **Visualization:** Plotly.js for real-time bar and line geometry
+* **Containerization:** Dockerized via a slim Debian-based image for rapid deployment
+
+---
 
 ## Deployment
 
-The project is containerized via Docker and optimized for Hugging Face Spaces. It utilizes a slim Debian-based Python image to minimize cold-start times while maintaining the computational overhead required for real-time BSM calculations.
+The application is configured to run on port 7860 by default.
+
+1. **Local Build:**
+   ```bash
+   docker build -t crypto-gex .
+2. **Execution:**
+   ```bash
+   docker run -p 7860:7860 crypto-gex
