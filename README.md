@@ -30,6 +30,15 @@ $$\text{Expected Move} = \text{Spot} \times \sigma \times \sqrt{T}$$
 ### 3. Max Pain and Pinning
 The engine identifies the "Max Pain" strike by iterating through the strike ladder to find the local minimum of the total loss function for option buyers. This serves as a center of gravity for price action as expiration approaches.
 
+### 4. VWAP (Volume Structure)
+Calculates the volume-weighted average strike price to identify where the bulk of trading activity is concentrated.
+
+### 5. Sentiment (PCR)
+The Put/Call Ratio based on Open Interest. Values greater than 1 indicate bearish sentiment, while values below 0.7 indicate bullish sentiment.
+
+### 6. Term Structure
+Aggregates the weighted Implied Volatility (IV) grouped by expiration dates to visualize the volatility surface across time.
+
 ---
 
 ## Data Pipeline Logic
@@ -46,23 +55,15 @@ The engine identifies the "Max Pain" strike by iterating through the strike ladd
 
 ---
 
-## Implementation Stack
+## API & WebSocket Documentation
 
-* **Language:** Python 3.10+
-* **Web Framework:** FastAPI with Asynchronous WebSockets
-* **Math:** NumPy for vectorized operations and `math.erf` for BSM CDF calculations
-* **Visualization:** Plotly.js for real-time bar and line geometry
-* **Containerization:** Dockerized via a slim Debian-based image for rapid deployment
+The backend streams real-time updates to the client via WebSockets.
 
----
-
-## Deployment
-
-The application is configured to run on port 7860 by default.
-
-1. **Local Build:**
-   ```bash
-   docker build -t crypto-gex .
-2. **Execution:**
-   ```bash
-   docker run -p 7860:7860 crypto-gex
+* **Endpoint:** `ws://<host>:<port>/ws`
+* **Subscription Payload:**
+  To subscribe to a specific ticker's option chain, send the following JSON payload:
+  ```json
+  {
+    "action": "sub",
+    "ticker": "BTC"
+  }
