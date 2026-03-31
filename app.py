@@ -4,21 +4,23 @@ from fastapi.responses import HTMLResponse
 import aiohttp
 import asyncio
 from datetime import datetime, timedelta
+import logging
+import json
+import contextlib
 import os
 import math
-import logging
-import contextlib
 
-# Configure logging at INFO level for system monitoring.
-# Standard out streams are used to align with Docker container logging best practices.
+# Configure logging at INFO level for system monitoring and audit trails.
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("Crypto-Gex")
 
-# Deribit public API base URL. Rate limit: 20 req/sec per IP.
+# Deribit public API base URL. 
+# Adhering to the unauthenticated public endpoint rate limit of 20 req/sec per IP.
 BASE_URL = "https://www.deribit.com/api/v2/public/"
 
-# Mapping for Deribit instrument date format (e.g., '28MAR26').
-# Constant time lookup dictionary to avoid runtime string manipulation overhead.
+# O(1) lookup mapping for Deribit instrument date formats (e.g., '28MAR26').
+# Utilizing a static dictionary avoids the processing overhead of datetime.strptime 
+# during high-frequency loop iterations over large option chains.
 MONTH_MAP = {
     "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
     "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12
@@ -26,36 +28,65 @@ MONTH_MAP = {
 
 class Greeks:
     """
-    Black-Scholes-Merton implementation using standard math libraries.
-    Assumes 0% continuous dividend yield (q=0) for crypto assets.
+    Closed-form Black-Scholes-Merton (BSM) options pricing engine.
+    
+    This implementation utilizes Python's standard `math` library to execute 
+    vectorized-style CDF and PDF calculations. By omitting heavyweight dependencies 
+    like NumPy or SciPy, we significantly reduce the Docker image size and 
+    cold-start execution time.
+    
+    Assumptions:
+    - European options execution model.
+    - 0% continuous dividend yield (standard for crypto assets).
+    - Risk-free rate is static per environment configuration.
     """
+    
     @staticmethod
     def nd1(d):
-        # Cumulative Distribution Function (CDF) of the standard normal distribution.
-        # Utilizes math.erf for high-precision approximation without heavy library imports.
+        """
+        Calculates the Cumulative Distribution Function (CDF) of the standard normal distribution.
+        Utilizes the mathematical error function (erf) for high-precision approximation.
+        """
         return 0.5 * (1.0 + math.erf(d / math.sqrt(2.0)))
 
     @staticmethod
     def npd1(d):
-        # Probability Density Function (PDF) of the standard normal distribution.
+        """
+        Calculates the Probability Density Function (PDF) of the standard normal distribution.
+        Used primarily for calculating secondary derivatives (Gamma and Vega).
+        """
         return math.exp(-0.5 * d**2) / math.sqrt(2 * math.pi)
 
     @classmethod
     def calculate(cls, S, K, T, sigma, r, type):
-        # Handle zero-time to expiry or zero implied volatility to prevent ZeroDivisionError.
+        """
+        Derives primary first and second-order Greeks.
+        
+        Args:
+            S (float): Current underlying spot price.
+            K (float): Strike price of the option contract.
+            T (float): Time to expiration, annualized (using 365-day convention).
+            sigma (float): Implied Volatility (IV) expressed as a decimal.
+            r (float): Annualized risk-free interest rate.
+            type (str): Contract type identifier ('C' for Call, 'P' for Put).
+            
+        Returns:
+            tuple: (Delta, Gamma, Theta, Vega). Returns zeroes if inputs are invalid 
+                   or if mathematical underflow occurs on deep OTM/ITM strikes.
+        """
+        # Guard clause: Handle zero-time to expiry or zero implied volatility 
+        # to prevent catastrophic division by zero errors in the d1 denominator.
         if T <= 0 or sigma <= 0:
             return 0.0, 0.0, 0.0, 0.0
         
         try:
-            # d1 represents the probability-weighted moneyness of the option.
             d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
-            # d2 represents the probability of the option expiring in-the-money.
             d2 = d1 - sigma * math.sqrt(T)
             
             if type == 'C': 
                 delta = cls.nd1(d1)
                 gamma = cls.npd1(d1) / (S * sigma * math.sqrt(T))
-                # Annualized Theta calculating decay over 365 days.
+                # Theta is calculated in annualized terms.
                 theta = -(S * cls.npd1(d1) * sigma) / (2 * math.sqrt(T)) - r * K * math.exp(-r * T) * cls.nd1(d2)
                 vega = S * cls.npd1(d1) * math.sqrt(T)
             else: 
@@ -66,21 +97,25 @@ class Greeks:
             
             return delta, gamma, theta, vega
         
-        # Catch specific math domain errors from deep OTM/ITM strikes to prevent thread crash.
+        # Explicitly catching arithmetic exceptions to prevent total loop failure.
+        # Deep out-of-the-money or deep in-the-money options can cause math domain errors.
         except (ValueError, ZeroDivisionError, OverflowError):
             return 0.0, 0.0, 0.0, 0.0
 
 class Cache:
     """
-    In-memory TTL cache to manage API request frequency.
-    Prevents IP bans by serving stale data (TTL: 5 seconds) during concurrent WebSocket requests.
+    Thread-safe, in-memory TTL (Time-To-Live) cache mechanism.
+    
+    Designed to mitigate rate-limiting blockades from Deribit APIs by serving 
+    stale data (up to X seconds) for redundant inbound WebSocket requests.
     """
     def __init__(self):
         self.store = {}
 
     def get(self, key):
         entry = self.store.get(key)
-        # Verify if the current monotonic clock exceeds the stored expiration timestamp.
+        # Verify if the payload exists and whether the current monotonic time 
+        # has surpassed the calculated expiry horizon.
         if entry and datetime.now() < entry['expiry']:
             return entry['data']
         return None
@@ -92,15 +127,23 @@ class Cache:
         }
 
 class Analytics:
+    """
+    Aggregated market structure calculators. 
+    Processes the raw option chain arrays to derive macro-positioning metrics.
+    """
+    
     @staticmethod
     def max_pain(chain):
-        # Calculate strike price where the total intrinsic value of open options is minimized.
+        """
+        Iterates through the aggregate open interest to calculate the theoretical 
+        spot price where option buyers experience maximum financial loss (Max Pain).
+        Acts as a strong pinning magnet as expirations approach zero DTE.
+        """
         if not chain: return 0
         strikes = sorted({o['k'] for o in chain})
         min_pain = float('inf')
         pain_price = 0
         
-        # Iterates through every potential settlement strike against the entire open interest matrix.
         for price in strikes:
             loss = 0
             for o in chain:
@@ -116,28 +159,32 @@ class Analytics:
 
     @staticmethod
     def pcr(chain):
-        # Put/Call Ratio based on absolute Open Interest, filtering by instrument type string.
+        """Computes the aggregate Put/Call Ratio based on outstanding Open Interest."""
         c = sum(o['oi'] for o in chain if o['ty'] == 'C')
         p = sum(o['oi'] for o in chain if o['ty'] == 'P')
         return round(p/c, 2) if c > 0 else 0
 
     @staticmethod
     def weighted_iv(chain):
-        # Volume-weighted aggregate implied volatility to normalize skew across strikes.
+        """Calculates average Implied Volatility, weighted by contract Open Interest."""
         total_oi = sum(o['oi'] for o in chain)
         if not total_oi: return 0
         return sum(o['iv'] * o['oi'] for o in chain) / total_oi
 
     @staticmethod
     def vwap(chain):
-        # Volume-Weighted Average Strike to determine intraday center of gravity.
+        """Volume-Weighted Average Price (Strike). Identifies where current trading volume is anchored."""
         total_vol = sum(o['vol'] for o in chain)
         if not total_vol: return 0
         return sum(o['k'] * o['vol'] for o in chain) / total_vol
 
     @staticmethod
     def skew_25d(chain, spot):
-        # Approximate 25-delta skew computing the IV differential between 10% OTM puts and calls.
+        """
+        Approximates 25-delta volatility skew.
+        Filters for strikes within a ±10% band of current spot price to measure 
+        the implied volatility premium of puts versus calls.
+        """
         calls = [o for o in chain if o['ty'] == 'C' and abs(o['k'] - spot*1.1) < spot*0.05]
         puts = [o for o in chain if o['ty'] == 'P' and abs(o['k'] - spot*0.9) < spot*0.05]
         if not calls or not puts: return 0
@@ -147,7 +194,7 @@ class Analytics:
 
     @staticmethod
     def term_structure(chain):
-        # Aggregates weighted IV per expiration maturity to build a temporal volatility curve.
+        """Generates a sequential array of weighted IVs mapped against expiration dates."""
         expiries = sorted({o['exp'] for o in chain})
         structure = []
         for e in expiries:
@@ -156,26 +203,28 @@ class Analytics:
         return structure
 
 class MarketData:
+    """
+    Handles asynchronous HTTP requests, connection pooling, and payload assembly.
+    """
     def __init__(self):
         self.session = None
         self.cache = Cache()
 
     async def start(self):
-        # Initialize persistent HTTP connection pooling to eliminate TCP handshake latency on repeated fetches.
+        """Initializes persistent aiohttp session for TCP connection re-use."""
         if not self.session:
             self.session = aiohttp.ClientSession(headers={"User-Agent": "CryptoGex/2.0"})
 
     async def stop(self):
-        # Graceful teardown of unclosed sockets to prevent file descriptor leaks.
+        """Gracefully tears down the network session on application exit."""
         if self.session: 
             await self.session.close()
 
     async def fetch(self, url):
-        # Cache bypass check
+        """Executes GET requests with strict timeouts and Cache integration."""
         cached = self.cache.get(url)
         if cached: return cached
         try:
-            # 5-second timeout drop to prevent hanging coroutines on API degradation.
             async with self.session.get(url, timeout=5) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -183,31 +232,40 @@ class MarketData:
                     return data
                 return None
         except Exception as e:
-            logger.error(f"Network error on fetch {url}: {e}")
+            logger.error(f"Network error on fetch: {e}")
             return None
 
     def _parse_expiry(self, date_str):
-        # Manual byte-slice parsing of standard Deribit 'DDMMMYY' instrument substrings.
+        """Optimized slicing function to convert Deribit string expirations to native datetime objects."""
         try:
             day = int(date_str[:2])
             mon = date_str[2:5].upper()
             year = int(date_str[5:]) + 2000
             if mon in MONTH_MAP: return datetime(year, MONTH_MAP[mon], day)
-        except: return None
+        except Exception: 
+            return None
         return None
 
     async def snapshot(self, ticker):
+        """
+        Orchestrates the data pipeline for a given asset ticker.
+        1. Fetches current index price.
+        2. Concurrently fetches coin-margined and USDC-margined books.
+        3. Parses, filters, and calculates Greeks for the entire chain.
+        4. Triggers macro analytics.
+        """
         spot = 0
-        # Failover iteration through base asset index price variants to establish the spot underlying.
+        
+        # Sequentially attempts to locate the spot index price.
         for idx in [f"{ticker.lower()}_usdc", f"{ticker.lower()}_usd"]:
             res = await self.fetch(f"{BASE_URL}get_index_price?index_name={idx}")
             if res and 'result' in res:
                 spot = res['result']['index_price']
                 break
         
-        if not spot: return {"error": "Spot price index rejected or unavailable."}
+        if not spot: return {"error": "Spot price not found from index providers."}
 
-        # Coroutine aggregation: fetch standard and stablecoin-margined books in parallel to halve total network I/O time.
+        # Issue concurrent, non-blocking HTTP requests for both margin types.
         urls = [
             f"{BASE_URL}get_book_summary_by_currency?currency={ticker}&kind=option",
             f"{BASE_URL}get_book_summary_by_currency?currency=USDC&kind=option"
@@ -225,7 +283,7 @@ class MarketData:
 
         for d in raw:
             name = d.get('instrument_name')
-            # Deduplication filter: Handles overlapping strikes between Coin-M and USDC-M instruments.
+            # Deduplicate entries if Deribit returns overlapping contracts across endpoints.
             if not name or name in seen: continue
             if not (name.startswith(f"{prefix}-") or name.startswith(f"{prefix}_")): continue
             seen.add(name)
@@ -235,20 +293,19 @@ class MarketData:
                 if len(parts) < 4: continue
                 
                 exp = self._parse_expiry(parts[1])
-                # Drop expired contracts to prevent negative time-to-maturity calculations in BSM.
+                # Filter out expired contracts to prevent negative time artifacts.
                 if not exp or exp <= now: continue
                 k = float(parts[2])
                 
-                # Spatial bounds filtering: Drop strikes outside a 0.2x to 2.5x variance of spot to save CPU cycles.
+                # Liquidity Filter: Discard contracts beyond 20% to 250% of current spot price.
                 if not (spot * 0.2 < k < spot * 2.5): continue
 
                 iv = d.get('mark_iv', 0) / 100
-                # Time continuous fraction relative to a 365-day trading year.
-                t = (exp - now).total_seconds() / 31536000
+                t = (exp - now).total_seconds() / 31536000  # Time in years
                 oi = d.get('open_interest', 0)
                 ty = parts[3]
 
-                # BSM execution utilizing a fixed 5% risk-free rate matrix.
+                # Hardcoded 5% Risk-Free Rate for calculation execution.
                 delta, gamma, theta, vega = Greeks.calculate(spot, k, t, iv, 0.05, ty)
 
                 chain.append({
@@ -256,12 +313,11 @@ class MarketData:
                     "vol": d.get('volume', 0), "ty": ty, "exp": parts[1],
                     "delta": delta, "gamma": gamma, "theta": theta, "vega": vega
                 })
-            except: 
+            except Exception: 
                 continue
 
-        if not chain: return {"error": "Zero valid contracts passed spatial filtering."}
+        if not chain: return {"error": "No valid options found passing threshold parameters."}
         
-        # Ensures client-side rendering engine receives an ordered matrix.
         chain.sort(key=lambda x: x['k'])
 
         return {
@@ -276,29 +332,34 @@ class MarketData:
             "ts": datetime.now().strftime("%H:%M:%S")
         }
 
+# Instantiate singleton engine
 engine = MarketData()
 
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup phase: Initialize global HTTP session pool.
+    """
+    FastAPI lifecycle manager. 
+    Handles async connection pool startup and teardown safely.
+    Removed OS-dependent local browser execution for Docker compatibility.
+    """
     await engine.start()
     yield
-    # Shutdown phase: Clean termination of client sessions.
     await engine.stop()
 
 app = FastAPI(title="Crypto.Gex Terminal", lifespan=lifespan)
 
 @app.websocket("/ws")
 async def ws_handler(websocket: WebSocket):
-    # Establish ASGI WebSocket connection.
+    """
+    Persistent duplex connection endpoint for frontend clients.
+    Accepts subscription requests and streams formatted chain payloads.
+    """
     await websocket.accept()
     try:
-        # Event loop listening for client JSON payloads.
         while True:
             msg = await websocket.receive_json()
             if msg.get('action') == 'sub':
                 ticker = msg.get('ticker', '').upper()
-                # Trigger pipeline calculation on explicit client subscription request.
                 res = await engine.snapshot(ticker)
                 
                 if "error" in res:
@@ -306,20 +367,19 @@ async def ws_handler(websocket: WebSocket):
                 else:
                     await websocket.send_json({"type": "data", "payload": res})
     except WebSocketDisconnect:
-        # Client silently dropped the connection without a standard closing handshake.
+        # Standard client drop-off, suppress logging noise.
         pass
     except Exception as e:
-        logger.error(f"WebSocket state error: {e}")
+        logger.error(f"WebSocket Pipeline Error: {e}")
     finally:
-        # Ensure socket termination to prevent zombie connections tying up the Uvicorn worker.
         try: 
             await websocket.close()
-        except: 
+        except Exception: 
             pass
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
-    # Dynamic file path resolution independent of the active working directory.
+    """Serves the static frontend rendering engine directly from the root."""
     current_dir = os.path.dirname(os.path.abspath(__file__))
     file_path = os.path.join(current_dir, "index.html")
     try:
@@ -330,15 +390,13 @@ async def home():
 
 @app.get("/api/v1/health")
 async def health():
-    # Simple L7 ping endpoint for load balancer health checks.
+    """Liveness probe for orchestration tools (e.g., Kubernetes/Docker Compose)."""
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 @app.get("/api/v1/snapshot/{ticker}")
 async def get_ticker_snapshot(ticker: str):
-    # REST fallback endpoint for clients incapable of maintaining a persistent WebSocket.
+    """REST fallback endpoint for single-shot external data ingestion."""
     return await engine.snapshot(ticker.upper())
 
 if __name__ == "__main__":
-    # Local execution entry point. 
-    # Port 8000 binds to the local loopback, overridden by Docker CMD when containerized.
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
