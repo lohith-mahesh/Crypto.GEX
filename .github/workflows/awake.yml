@@ -8,8 +8,5 @@ jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - name: Ping Copula Ops
-        run: curl -I https://lohithmahesh-copula-ops.hf.space/
-        
       - name: Ping Crypto Gex
         run: curl -I https://lohithmahesh-crypto-gex.hf.space/
