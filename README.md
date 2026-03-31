@@ -17,53 +17,40 @@ The system operates on a split-execution model to balance precision with low-lat
 
 ## Core Analytics
 
-### 1. Net Gamma Exposure (GEX)
-The terminal calculates the dollar value that dealers must hedge per 1% move in the spot price. This identifies "Gamma Walls" where hedging activity either dampens or accelerates price volatility.
-
-$$GEX = \Gamma \times \text{Open Interest} \times \text{Spot}^{2} \times 0.01$$
-
-### 2. Oracle 1-Sigma Range
-The system projects the expected move for the current session or specific expiry using a weighted Implied Volatility ($\sigma$) metric.
-
-$$\text{Expected Move} = \text{Spot} \times \sigma \times \sqrt{T}$$
-
-### 3. Max Pain and Pinning
-The engine identifies the "Max Pain" strike by iterating through the strike ladder to find the local minimum of the total loss function for option buyers. This serves as a center of gravity for price action as expiration approaches.
-
-### 4. VWAP (Volume Structure)
-Calculates the volume-weighted average strike price to identify where the bulk of trading activity is concentrated.
-
-### 5. Sentiment (PCR)
-The Put/Call Ratio based on Open Interest. Values greater than 1 indicate bearish sentiment, while values below 0.7 indicate bullish sentiment.
-
-### 6. Term Structure
-Aggregates the weighted Implied Volatility (IV) grouped by expiration dates to visualize the volatility surface across time.
+* **Net Gamma Exposure (GEX):** Calculates the dollar value dealers must hedge per 1% move in the spot price, identifying "Gamma Walls". Calculated as: `Gamma * Open Interest * Spot^2 * 0.01`.
+* **Oracle 1-Sigma Range:** Projects the expected move for the current session or specific expiry using a weighted Implied Volatility metric. Calculated as: `Spot * Implied Volatility * sqrt(Time)`.
+* **Max Pain and Pinning:** Identifies the strike where option writers lose the least amount of money, serving as a center of gravity for price action near expiration.
+* **Volume Structure (VWAP):** Calculates the volume-weighted average strike price across the chain to identify where the bulk of trading activity is concentrated.
+* **Sentiment (PCR):** The Put/Call ratio based on open interest. A value > 1 indicates bearish sentiment, while < 0.7 indicates bullish sentiment.
+* **Term Structure:** Groups weighted Implied Volatility by expiration date to map out volatility expectations over time.
 
 ---
 
 ## Data Pipeline Logic
 
-### Real-Time Ingestion
-* **Concurrency:** Utilizes `asyncio.gather` and `aiohttp` to fetch index prices and book summaries for Coin-margined and USDC-margined instruments simultaneously.
-* **Caching:** Implements a 5-second TTL (Time-To-Live) cache to stay within Deribit public rate limits of 20 requests per second.
-
-### Filtering and Assumptions
-* **Moneyness:** Only strikes within a 20% to 250% range of the spot price are processed to eliminate illiquid data.
-* **Temporal:** Expired or near-instantaneous contracts are discarded to prevent mathematical artifacts in GEX spikes.
+* **Real-Time Ingestion:** Utilizes concurrent fetches via `aiohttp` to consolidate Coin-margined and USDC-margined instruments.
+* **Caching:** Implements an in-memory 5-second TTL cache to prevent exceeding Deribit's public API limits of 20 requests per second.
+* **Filtering:** Only processes strikes within a 20% to 250% range of the spot price to eliminate illiquid data. Expired contracts are discarded.
 * **Risk-Free Rate:** Hardcoded at 5% (0.05) to approximate the cost of carry in crypto-native margin environments.
-* **Skew:** The 25-delta skew is calculated as a ±10% spot price approximation for computational efficiency.
 
 ---
 
-## API & WebSocket Documentation
+## Implementation Stack
 
-The backend streams real-time updates to the client via WebSockets.
+* **Backend Framework:** Python 3.10+ using FastAPI and standard `math` library operations.
+* [cite_start]**Dependencies:** Relies on `fastapi`, `uvicorn[standard]`, and `aiohttp`[cite: 2]. [cite_start]Note: While `numpy` is listed in requirements[cite: 2], it is not actively used in the current BSM implementation.
+* **Frontend:** Vanilla JavaScript, Tailwind CSS (via CDN), and Plotly.js for geometric rendering.
+* [cite_start]**Containerization:** Dockerized via a slim Python 3.10 image.
 
-* **Endpoint:** `ws://<host>:<port>/ws`
-* **Subscription Payload:**
-  To subscribe to a specific ticker's option chain, send the following JSON payload:
-  ```json
-  {
-    "action": "sub",
-    "ticker": "BTC"
-  }
+---
+
+## WebSocket API Integration
+
+The terminal establishes a real-time connection via the `/ws` endpoint.
+
+**Client Subscription Payload:**
+```json
+{
+  "action": "sub",
+  "ticker": "BTC"
+}
